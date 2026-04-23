@@ -164,6 +164,28 @@ func (mcm *mcmCloudProvider) NodeGroupForNode(node *apiv1.Node) (cloudprovider.N
 	return ng, nil
 }
 
+// IsNodePreservedAndNotReady returns true if the node is NotReady and is preserved.
+// Implements cloudprovider.PreservationInfoProvider
+func (mcm *mcmCloudProvider) IsNodePreservedAndNotReady(node *apiv1.Node) (bool, error) {
+	mInfo, err := mcm.mcmManager.getMachineInfo(node)
+	if err != nil {
+		return false, err
+	}
+	if mInfo == nil || !mInfo.MachinePreserved {
+		return false, nil
+	}
+	// Only exclude node if NotReady. A preserved but Ready node
+	// should still be counted normally.
+	for _, cond := range node.Status.Conditions {
+		if cond.Type == apiv1.NodeReady {
+			notReady := cond.Status == apiv1.ConditionFalse || cond.Status == apiv1.ConditionUnknown
+			return notReady, nil
+		}
+	}
+	// No Ready condition found — treat as NotReady.
+	return true, nil
+}
+
 // HasInstance returns whether a given node has a corresponding instance in this cloud provider
 func (mcm *mcmCloudProvider) HasInstance(*apiv1.Node) (bool, error) {
 	return true, cloudprovider.ErrNotImplemented
@@ -409,18 +431,18 @@ func (ngImpl *nodeGroup) ForceDeleteNodes(nodes []*apiv1.Node) error {
 		} else if !belongs {
 			return fmt.Errorf("%s belongs to a different MachineDeployment than %q", node.Name, ngImpl.Name)
 		}
+		// If the machine is preserved, has no backing node object, and the VM exists, we need this case to prevent deletion of a preserved machine and the VM.
+		// This is required since there is no node object to annotate with the NoScaleDownAnnotation.
+		if mInfo.MachinePreserved {
+			klog.V(3).Infof("for NodeGroup %q, Node %q corresponding to Machine %q is marked as preserved - skipping deletion", ngImpl.Name, node.Name, mInfo.Key.Name)
+			continue
+		}
 		if mInfo.FailedOrTerminating {
 			klog.V(3).Infof("for NodeGroup %q, Machine %q is already marked as terminating - skipping deletion", ngImpl.Name, mInfo.Key.Name)
 			continue
 		}
 		if eligibility.HasNoScaleDownAnnotation(node) {
 			klog.V(4).Infof("for NodeGroup %q, Node %q corresponding to Machine %q is marked with ScaleDownDisabledAnnotation %q - skipping deletion", ngImpl.Name, node.Name, mInfo.Key.Name, eligibility.ScaleDownDisabledKey)
-			continue
-		}
-		// If the machine is preserved, has no backing node object, and the VM exists, we need this case to prevent deletion of a preserved machine and the VM.
-		// This is required since there is no node object to annotate with the NoScaleDownAnnotation.
-		if mInfo.MachinePreserved {
-			klog.V(3).Infof("for NodeGroup %q, Machine %q is marked as preserved - skipping deletion", ngImpl.Name, mInfo.Key.Name)
 			continue
 		}
 		toBeDeletedMachineInfos = append(toBeDeletedMachineInfos, *mInfo)

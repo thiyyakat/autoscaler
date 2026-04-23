@@ -147,6 +147,10 @@ type ClusterStateRegistry struct {
 	// scaleUpFailures contains information about scale-up failures for each node group. It should be
 	// cleared periodically to avoid unnecessary accumulation.
 	scaleUpFailures map[string][]ScaleUpFailure
+
+	// FORK-CHANGE: preservedNodeCount tracks preserved nodes to exclude from unready counts.
+	// This value is updated each time updateReadinessStats runs.
+	preservedNodeCount int
 }
 
 // NodeGroupScalingSafety contains information about the safety of the node group to scale up/down.
@@ -420,9 +424,13 @@ func (csr *ClusterStateRegistry) IsClusterHealthy() bool {
 	defer csr.Unlock()
 
 	totalUnready := len(csr.totalReadiness.Unready)
+	// FORK-CHANGE: Exclude preserved nodes from the denominator so that
+	// they do not skew the unready percentage threshold since they are intentionally preserved in NotReady.
+	// This is done to prevent CA from disabling scaling due to preserved NotReady nodes.
+	totalNodes := len(csr.nodes) - csr.preservedNodeCount
 
 	if totalUnready > csr.config.OkTotalUnreadyCount &&
-		float64(totalUnready) > csr.config.MaxTotalUnreadyPercentage/100.0*float64(len(csr.nodes)) {
+		float64(totalUnready) > csr.config.MaxTotalUnreadyPercentage/100.0*float64(totalNodes) {
 		return false
 	}
 
@@ -642,9 +650,27 @@ func (csr *ClusterStateRegistry) updateReadinessStats(currentTime time.Time) {
 		return current
 	}
 
+	// FORK-CHANGE: If the cloud provider supports preservation info, preserved nodes are excluded
+	// from the unready count and the cluster healthy check does not fail which causes CA to disable scaling
+	preservationProvider, hasPreservationInfo := csr.cloudProvider.(cloudprovider.PreservationInfoProvider)
+	preservedCount := 0
+
 	for _, node := range csr.nodes {
 		nodeGroup, errNg := csr.cloudProvider.NodeGroupForNode(node)
 		nr, errReady := kube_util.GetNodeReadiness(node)
+
+		// FORK-CHANGE: Skip preserved nodes — they are intentionally NotReady and should not
+		// count against the unready thresholds.
+		if hasPreservationInfo {
+			preserved, err := preservationProvider.IsNodePreservedAndNotReady(node)
+			if err != nil {
+				klog.Warningf("Failed to check preservation status for node %s: %v", node.Name, err)
+			} else if preserved {
+				klog.V(4).Infof("Node %s is preserved, excluding from unready count", node.Name)
+				preservedCount++
+				continue
+			}
+		}
 
 		// Node is most likely not autoscaled, however check the errors.
 		if nodeGroup == nil || reflect.ValueOf(nodeGroup).IsNil() {
@@ -659,6 +685,7 @@ func (csr *ClusterStateRegistry) updateReadinessStats(currentTime time.Time) {
 		}
 		total = update(total, node, nr)
 	}
+	csr.preservedNodeCount = preservedCount
 
 	for _, unregistered := range csr.unregisteredNodes {
 		nodeGroup, errNg := csr.cloudProvider.NodeGroupForNode(unregistered.Node)

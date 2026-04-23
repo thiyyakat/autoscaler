@@ -158,6 +158,17 @@ type CloudProvider interface {
 	Refresh() error
 }
 
+// FORK-CHANGE:
+
+// PreservationInfoProvider is an optional interface for cloud providers that support
+// node preservation. Preserved nodes are intentionally NotReady and should be excluded from
+// cluster health check unready counts.
+// Callers MUST handle `cloudprovider.ErrNotImplemented`.
+type PreservationInfoProvider interface {
+	// IsNodePreservedAndNotReady returns true if the node is preserved and should be excluded from unready counts.
+	IsNodePreservedAndNotReady(node *apiv1.Node) (bool, error)
+}
+
 // ErrNotImplemented is returned if a method is not implemented.
 var ErrNotImplemented = errors.NewAutoscalerError(errors.InternalError, "Not implemented")
 
