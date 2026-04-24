@@ -419,6 +419,116 @@ func TestForceDeleteNodes(t *testing.T) {
 	}
 }
 
+func TestIsNodePreservedAndNotReady(t *testing.T) {
+	type expect struct {
+		preserved bool
+		err       bool
+	}
+	type data struct {
+		name   string
+		setup  setup
+		node   *corev1.Node
+		expect expect
+	}
+
+	preservedMachineStatus := &v1alpha1.MachineStatus{
+		CurrentStatus: v1alpha1.CurrentStatus{
+			PreserveExpiryTime: &metav1.Time{Time: time.Now().Add(1 * time.Hour)},
+		},
+	}
+
+	notReadyNode := func(name, providerID string) *corev1.Node {
+		n := newNode(name, providerID)
+		n.Status.Conditions = []corev1.NodeCondition{
+			{Type: corev1.NodeReady, Status: corev1.ConditionFalse},
+		}
+		return n
+	}
+
+	readyNode := func(name, providerID string) *corev1.Node {
+		n := newNode(name, providerID)
+		n.Status.Conditions = []corev1.NodeCondition{
+			{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+		}
+		return n
+	}
+
+	table := []data{
+		{
+			name: "preserved machine with NotReady node returns true",
+			setup: setup{
+				nodes:              []*corev1.Node{notReadyNode("node-1", "fakeID/i1")},
+				machines:           newMachines(1, "fakeID", preservedMachineStatus, "machinedeployment-1", "machineset-1", []string{"3"}),
+				machineSets:        newMachineSets(1, "machinedeployment-1"),
+				machineDeployments: newMachineDeployments(1, 1, nil, nil, nil),
+				nodeGroups:         []string{nodeGroup2},
+			},
+			node:   notReadyNode("node-1", "fakeID/i1"),
+			expect: expect{preserved: true, err: false},
+		},
+		{
+			name: "preserved machine with Ready node returns false",
+			setup: setup{
+				nodes:              []*corev1.Node{readyNode("node-1", "fakeID/i1")},
+				machines:           newMachines(1, "fakeID", preservedMachineStatus, "machinedeployment-1", "machineset-1", []string{"3"}),
+				machineSets:        newMachineSets(1, "machinedeployment-1"),
+				machineDeployments: newMachineDeployments(1, 1, nil, nil, nil),
+				nodeGroups:         []string{nodeGroup2},
+			},
+			node:   readyNode("node-1", "fakeID/i1"),
+			expect: expect{preserved: false, err: false},
+		},
+		{
+			name: "non-preserved machine with NotReady node returns false",
+			setup: setup{
+				nodes:              []*corev1.Node{notReadyNode("node-1", "fakeID/i1")},
+				machines:           newMachines(1, "fakeID", nil, "machinedeployment-1", "machineset-1", []string{"3"}),
+				machineSets:        newMachineSets(1, "machinedeployment-1"),
+				machineDeployments: newMachineDeployments(1, 1, nil, nil, nil),
+				nodeGroups:         []string{nodeGroup2},
+			},
+			node:   notReadyNode("node-1", "fakeID/i1"),
+			expect: expect{preserved: false, err: false},
+		},
+		{
+			name: "preserved machine with no Ready condition returns true (treated as NotReady)",
+			setup: setup{
+				nodes:              []*corev1.Node{newNode("node-1", "fakeID/i1")},
+				machines:           newMachines(1, "fakeID", preservedMachineStatus, "machinedeployment-1", "machineset-1", []string{"3"}),
+				machineSets:        newMachineSets(1, "machinedeployment-1"),
+				machineDeployments: newMachineDeployments(1, 1, nil, nil, nil),
+				nodeGroups:         []string{nodeGroup2},
+			},
+			node:   newNode("node-1", "fakeID/i1"),
+			expect: expect{preserved: true, err: false},
+		},
+	}
+
+	for _, entry := range table {
+		entry := entry
+		t.Run(entry.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			stop := make(chan struct{})
+			defer close(stop)
+			controlMachineObjects, targetCoreObjects, _ := setupEnv(&entry.setup)
+			m, trackers, hasSyncedCacheFns := createMcmManager(t, stop, testNamespace, entry.setup.nodeGroups, controlMachineObjects, targetCoreObjects, nil)
+			defer trackers.Stop()
+			waitForCacheSync(t, stop, hasSyncedCacheFns)
+
+			provider := &mcmCloudProvider{mcmManager: m}
+			preserved, err := provider.IsNodePreservedAndNotReady(entry.node)
+
+			if entry.expect.err {
+				g.Expect(err).To(HaveOccurred())
+			} else {
+				g.Expect(err).To(BeNil())
+			}
+			g.Expect(preserved).To(Equal(entry.expect.preserved))
+		})
+	}
+}
+
 func TestIdempotencyOfDeleteNodes(t *testing.T) {
 	setupObj := setup{
 		nodes:              newNodes(3, "fakeID"),
